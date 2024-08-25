@@ -50,8 +50,8 @@ func wsEndpoint(w http.ResponseWriter, r *http.Request) {
 		log.Println(err)
 	}
 
-	log.Println("Client Connected")
-	err = ws.WriteMessage(1, []byte("Hi Client!"))
+	log.Println("User Connected")
+	err = ws.WriteMessage(1, []byte("Hi User!"))
 	if err != nil {
 		log.Println(err)
 	}
@@ -66,7 +66,7 @@ func setupRoutes() {
 }
 
 func main() {
-	fmt.Println("Hello World")
+	fmt.Println("Server started at :5555")
 	setupRoutes()
 	log.Fatal(http.ListenAndServe(":5555", nil))
 }
