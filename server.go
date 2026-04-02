@@ -1,63 +1,153 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-// We'll need to define an Upgrader
-// this will require a Read and Write buffer size
+// Upgrader configuration for WebSocket connections
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-	CheckOrigin:     func(r *http.Request) bool { return true },
+	// Allow connections from any origin (adjust for production)
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-// define a reader which will listen for
-// new messages being sent to our WebSocket
-// endpoint
+// ConnectionManager handles all active WebSocket connections
+type ConnectionManager struct {
+	connections map[*websocket.Conn]bool
+	mutex       sync.RWMutex
+}
+
+func NewConnectionManager() *ConnectionManager {
+	return &ConnectionManager{
+		connections: make(map[*websocket.Conn]bool),
+	}
+}
+
+func (cm *ConnectionManager) Add(conn *websocket.Conn) {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+	cm.connections[conn] = true
+	log.Printf("Connection added. Total connections: %d", len(cm.connections))
+}
+
+func (cm *ConnectionManager) Remove(conn *websocket.Conn) {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+	delete(cm.connections, conn)
+	log.Printf("Connection removed. Total connections: %d", len(cm.connections))
+}
+
+func (cm *ConnectionManager) Broadcast(messageType int, message []byte) {
+	cm.mutex.RLock()
+	defer cm.mutex.RUnlock()
+	for conn := range cm.connections {
+		if err := conn.WriteMessage(messageType, message); err != nil {
+			log.Printf("Broadcast error: %v", err)
+		}
+	}
+}
+
+func (cm *ConnectionManager) Count() int {
+	cm.mutex.RLock()
+	defer cm.mutex.RUnlock()
+	return len(cm.connections)
+}
+
+var manager = NewConnectionManager()
+
+// reader listens for new messages on a WebSocket connection
 func reader(conn *websocket.Conn) {
+	defer func() {
+		manager.Remove(conn)
+		conn.Close()
+	}()
+
+	// Set read deadline and pong handler for connection health
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
 	for {
-		// read in a message
 		messageType, p, err := conn.ReadMessage()
 		if err != nil {
-			log.Println(err)
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("Read error: %v", err)
+			}
 			return
 		}
-		// print out that message for clarity
-		log.Println(string(p))
 
+		log.Printf("Received: %s", string(p))
+
+		// Echo the message back
 		if err := conn.WriteMessage(messageType, p); err != nil {
-			log.Println(err)
+			log.Printf("Write error: %v", err)
 			return
 		}
+	}
+}
 
+// ping sends periodic pings to keep connection alive
+func ping(conn *websocket.Conn, done chan struct{}) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		case <-done:
+			return
+		}
 	}
 }
 
 func homePage(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "Home Page")
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "WebSocket Server - Planning Travels\nActive connections: %d", manager.Count())
 }
 
 func wsEndpoint(w http.ResponseWriter, r *http.Request) {
-	// upgrade this connection to a WebSocket
-	// connection
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println(err)
+		log.Printf("Upgrade error: %v", err)
+		return
 	}
 
-	log.Println("User Connected")
-	err = ws.WriteMessage(1, []byte("Hi User!"))
-	if err != nil {
-		log.Println(err)
+	manager.Add(ws)
+	log.Printf("User connected from %s", r.RemoteAddr)
+
+	// Send welcome message
+	if err := ws.WriteMessage(websocket.TextMessage, []byte("Hi User!")); err != nil {
+		log.Printf("Welcome message error: %v", err)
+		manager.Remove(ws)
+		ws.Close()
+		return
 	}
-	// listen indefinitely for new messages coming
-	// through on our WebSocket connection
+
+	// Start ping goroutine to keep connection alive
+	done := make(chan struct{})
+	go ping(ws, done)
+
+	// Listen for messages (blocking)
 	reader(ws)
+
+	// Signal ping goroutine to stop
+	close(done)
 }
 
 func setupRoutes() {
@@ -66,7 +156,32 @@ func setupRoutes() {
 }
 
 func main() {
-	fmt.Println("Server started at :5555")
 	setupRoutes()
-	log.Fatal(http.ListenAndServe(":5555", nil))
+
+	server := &http.Server{
+		Addr:         ":5555",
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+
+	// Graceful shutdown
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		<-sigChan
+
+		log.Println("Shutting down server...")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("Shutdown error: %v", err)
+		}
+	}()
+
+	log.Println("WebSocket server started at :5555")
+	if err := server.ListenAndServe(); err != http.ErrServerClosed {
+		log.Fatalf("Server error: %v", err)
+	}
+	log.Println("Server stopped")
 }
